@@ -2,164 +2,176 @@ import ast
 import os
 import argparse
 import csv
+from abc import ABC, abstractmethod
+from typing import List, Dict
 
-def analyze_script(script_path: str) -> list[dict[str, str]]:
-    """Analyze a Python script to extract information about its functions and dependencies."""
-    with open(script_path, 'r') as file:
-        tree = ast.parse(file.read(), script_path)
-    
-    functions = []
-    imported_modules = set()
 
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in node.names:
-                imported_modules.add(alias.name.split('.')[0])
-        elif isinstance(node, ast.FunctionDef):
-            function_name = node.name
-            args = [arg.arg for arg in node.args.args]
-            returns = 'None' if node.returns is None else ast.dump(node.returns)
-            dependencies = set()
+# --- Models ---
 
-            for subnode in ast.walk(node):
-                if isinstance(subnode, ast.Call):
-                    if isinstance(subnode.func, ast.Name) and subnode.func.id in imported_modules:
-                        dependencies.add(subnode.func.id)
-                    elif isinstance(subnode.func, ast.Attribute):
-                        if isinstance(subnode.func.value, ast.Name) and subnode.func.value.id in imported_modules:
-                            dependencies.add(subnode.func.value.id)
+class FunctionInfo:
+    def __init__(self, script: str, name: str, args: str, returns: str, deps: str):
+        self.script = script
+        self.name = name
+        self.args = args
+        self.returns = returns
+        self.deps = deps
 
-            functions.append({
-                'Function Name': function_name,
-                'Args': ', '.join(args),
-                'Returns': returns,
-                'Dependencies': ', '.join(dependencies)
-            })
+    def as_dict(self) -> Dict[str, str]:
+        return {
+            'Script Name': self.script,
+            'Function Name': self.name,
+            'Args': self.args,
+            'Returns': self.returns,
+            'Dependencies': self.deps
+        }
 
-    return functions
 
-def generate_report(directory: str) -> list[dict[str, str]]:
-    """Generate a report of functions from all Python scripts in the specified directory."""
-    report = []
-    for filename in os.listdir(directory):
-        if filename.endswith('.py'):
-            script_path = os.path.join(directory, filename)
-            functions = analyze_script(script_path)
-            for func in functions:
-                report.append({
-                    'Script Name': filename,
-                    'Function Name': func['Function Name'],
-                    'Args': func['Args'],
-                    'Returns': func['Returns'],
-                    'Dependencies': func['Dependencies']
+# --- Analyzer ---
+
+class ScriptAnalyzer:
+    def __init__(self, script_path: str):
+        self.script_path = script_path
+
+    def analyze(self) -> List[FunctionInfo]:
+        with open(self.script_path, 'r') as file:
+            tree = ast.parse(file.read(), self.script_path)
+
+        functions = []
+        imports = {alias.name.split('.')[0] for node in ast.walk(tree)
+                   if isinstance(node, (ast.Import, ast.ImportFrom))
+                   for alias in node.names}
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                name = node.name
+                args = ', '.join(arg.arg for arg in node.args.args)
+                returns = 'None' if node.returns is None else ast.dump(node.returns)
+                deps = {
+                    sub.func.id for sub in ast.walk(node)
+                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+                    and sub.func.id in imports
+                }.union({
+                    sub.func.value.id for sub in ast.walk(node)
+                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                    and isinstance(sub.func.value, ast.Name)
+                    and sub.func.value.id in imports
                 })
-    return report
 
-def truncate_string(string: str, width: int) -> str:
-    """Truncate a string if it exceeds the specified width, adding '...'."""
-    return string if len(string) <= width else string[:width-3] + '...'
+                functions.append(FunctionInfo(
+                    script=os.path.basename(self.script_path),
+                    name=name,
+                    args=args,
+                    returns=returns,
+                    deps=', '.join(sorted(deps))
+                ))
+        return functions
 
-def calculate_column_widths(report: list[dict[str, str]]) -> dict[str, int]:
-    """Calculate the maximum width needed for each column based on the report data."""
-    headers = ['Script Name', 'Function Name', 'Args', 'Returns', 'Dependencies']
-    col_widths = {header: len(header) for header in headers}
-    for row in report:
-        for key, value in row.items():
-            col_widths[key] = max(col_widths[key], len(value))
-    return col_widths
 
-def print_report(report: list[dict[str, str]]):
-    col_widths = {
-        'Script Name': 20,
-        'Function Name': 25,
-        'Args': 40,
-        'Returns': 100,
-        'Dependencies': 15
-    }
+# --- Report Generation ---
 
-    # Header
-    header = (
-        f"| {truncate_string('Script Name', col_widths['Script Name'])} "
-        f"| {truncate_string('Function Name', col_widths['Function Name'])} "
-        f"| {truncate_string('Args', col_widths['Args'])} "
-        f"| {truncate_string('Returns', col_widths['Returns'])} "
-        f"| {truncate_string('Dependencies', col_widths['Dependencies'])} |"
-    )
-    print(header)
-    print("|" + "|".join(['-' * col_widths[col] for col in col_widths]) + "|")  # Divider
+class ReportGenerator:
+    def __init__(self, directory: str):
+        self.directory = directory
 
-    # Rows
-    for row in report:
-        print(
-            f"| {truncate_string(row['Script Name'], col_widths['Script Name'])} "
-            f"| {truncate_string(row['Function Name'], col_widths['Function Name'])} "
-            f"| {truncate_string(row['Args'], col_widths['Args'])} "
-            f"| {truncate_string(row['Returns'], col_widths['Returns'])} "
-            f"| {truncate_string(row['Dependencies'], col_widths['Dependencies'])} |"
-        )
+    def generate(self) -> List[FunctionInfo]:
+        report = []
+        for fname in os.listdir(self.directory):
+            if fname.endswith('.py'):
+                analyzer = ScriptAnalyzer(os.path.join(self.directory, fname))
+                report.extend(analyzer.analyze())
+        return report
 
-def save_report_to_csv(report: list[dict[str, str]], csv_path: str):
-    """Save the report to a CSV file."""
-    with open(csv_path, 'w', newline='') as csvfile:
-        fieldnames = ['Script Name', 'Function Name', 'Args', 'Returns', 'Dependencies']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
 
-        writer.writeheader()
-        for row in report:
-            writer.writerow(row)
+# --- Reporting Abstraction ---
 
-def save_report_to_markdown(report: list[dict[str, str]], md_path: str):
-    """Save the report to a Markdown file."""
-    if not report:
-        print("No functions found in the given directory.")
-        return
-    
-    col_widths = calculate_column_widths(report)
-    
-    with open(md_path, 'w') as mdfile:
-        # Header
-        header = (
-            f"| {truncate_string('Script Name', col_widths['Script Name'])} "
-            f"| {truncate_string('Function Name', col_widths['Function Name'])} "
-            f"| {truncate_string('Args', col_widths['Args'])} "
-            f"| {truncate_string('Returns', col_widths['Returns'])} "
-            f"| {truncate_string('Dependencies', col_widths['Dependencies'])} |"
-        )
-        separator = f"|{'-' * col_widths['Script Name']}|{'-' * col_widths['Function Name']}|{'-' * col_widths['Args']}|{'-' * col_widths['Returns']}|{'-' * col_widths['Dependencies']}|"
-        mdfile.write(header + "\n" + separator + "\n")
+class Reporter(ABC):
+    @abstractmethod
+    def output(self, data: List[FunctionInfo]) -> None:
+        pass
 
-        # Rows
-        for row in report:
-            mdfile.write(
-                f"| {truncate_string(row['Script Name'], col_widths['Script Name'])} "
-                f"| {truncate_string(row['Function Name'], col_widths['Function Name'])} "
-                f"| {truncate_string(row['Args'], col_widths['Args'])} "
-                f"| {truncate_string(row['Returns'], col_widths['Returns'])} "
-                f"| {truncate_string(row['Dependencies'], col_widths['Dependencies'])} |\n"
-            )
+
+class ConsoleReporter(Reporter):
+    def __init__(self, col_widths=None):
+        self.col_widths = col_widths or {
+            'Script Name': 20, 'Function Name': 25, 'Args': 40,
+            'Returns': 100, 'Dependencies': 15
+        }
+
+    def truncate(self, text: str, width: int) -> str:
+        return text if len(text) <= width else text[:width - 3] + '...'
+
+    def output(self, data: List[FunctionInfo]) -> None:
+        headers = self.col_widths.keys()
+        header = "| " + " | ".join(self.truncate(h, self.col_widths[h]) for h in headers) + " |"
+        divider = "|" + "|".join('-' * self.col_widths[h] for h in headers) + "|"
+
+        print(header)
+        print(divider)
+        for row in data:
+            print("| " + " | ".join(
+                self.truncate(getattr(row, attr.lower().replace(' ', '_')), self.col_widths[col])
+                for col, attr in zip(headers, row.as_dict().keys())
+            ) + " |")
+
+
+class CSVReporter(Reporter):
+    def __init__(self, path: str):
+        self.path = path
+
+    def output(self, data: List[FunctionInfo]) -> None:
+        with open(self.path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=list(data[0].as_dict().keys()))
+            writer.writeheader()
+            for row in data:
+                writer.writerow(row.as_dict())
+
+
+class MarkdownReporter(Reporter):
+    def __init__(self, path: str):
+        self.path = path
+
+    def _calc_widths(self, rows: List[FunctionInfo]) -> Dict[str, int]:
+        headers = list(rows[0].as_dict().keys())
+        return {
+            h: max(len(h), max(len(r.as_dict()[h]) for r in rows))
+            for h in headers
+        }
+
+    def output(self, data: List[FunctionInfo]) -> None:
+        widths = self._calc_widths(data)
+        headers = list(data[0].as_dict().keys())
+
+        with open(self.path, 'w') as f:
+            f.write("| " + " | ".join(h.ljust(widths[h]) for h in headers) + " |\n")
+            f.write("|" + "|".join('-' * (widths[h] + 2) for h in headers) + "|\n")
+            for row in data:
+                f.write("| " + " | ".join(row.as_dict()[h].ljust(widths[h]) for h in headers) + " |\n")
+
+
+# --- Main CLI Entry ---
 
 def main():
-    """Main function to parse arguments and generate reports."""
-    parser = argparse.ArgumentParser(description="Generate a report of functions in Python scripts.")
-    parser.add_argument('-d', '--directory', required=True, help='Path to the input files.')
-    parser.add_argument('-o', '--output', required=True, help='Path to the output CSV file.')
-    parser.add_argument('-m', '--markdown', required=False, help='Path to the output Markdown file.')
+    parser = argparse.ArgumentParser(description="Analyze Python scripts and report function signatures.")
+    parser.add_argument('-d', '--directory', required=True, help='Directory of Python files')
+    parser.add_argument('-o', '--output', required=True, help='Path to output CSV file')
+    parser.add_argument('-m', '--markdown', help='Path to output Markdown file')
     args = parser.parse_args()
 
     if not os.path.isdir(args.directory):
-        print(f"Error: The directory {args.directory} does not exist.")
+        print(f"❌ Error: Directory {args.directory} does not exist.")
         return
 
-    report = generate_report(args.directory)
+    report = ReportGenerator(args.directory).generate()
     if not report:
-        print("No Python scripts with functions found in the given directory.")
+        print("⚠️  No Python functions found.")
         return
 
-    print_report(report)
-    save_report_to_csv(report, args.output)
+    ConsoleReporter().output(report)
+    CSVReporter(args.output).output(report)
 
     if args.markdown:
-        save_report_to_markdown(report, args.markdown)
+        MarkdownReporter(args.markdown).output(report)
+
 
 if __name__ == '__main__':
     main()
