@@ -1,100 +1,92 @@
 import sys
 import gzip
-import re
 import argparse
+import re
 from itertools import islice
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VALID_SEQ_RE = re.compile(r"^[A-Za-z\-\.\~\*]+$")
+VALID_SEQ_RE = re.compile(r"^[A-Za-z\-\.\~\*]+$")  # FASTA allowed chars
 
 def open_file(path):
     return gzip.open(path, 'rt') if path.endswith('.gz') else open(path)
 
-# FASTQ: records are 4 lines
-def parse_fastq(file):
-    while True:
-        lines = list(islice(file, 4))
-        if not lines:
-            break
-        if len(lines) != 4:
-            yield None, "Incomplete FASTQ record"
-        else:
-            yield lines, None
-
-def validate_fastq_record(record):
-    lines, err = record
-    if err:
-        return False, err
-    h, s, p, q = [l.strip() for l in lines]
-    if not h.startswith("@"):
-        return False, "Missing '@' in header"
-    if not p.startswith("+"):
-        return False, "Missing '+' line"
-    if len(s) != len(q):
-        return False, "Sequence and quality lengths differ"
-    return True, None
-
-# FASTA: records start with '>'
-def parse_fasta(file):
-    records = []
-    group = []
-    for line in file:
-        if line.startswith(">"):
-            if group:
-                records.append(group)
-                group = []
-        group.append(line)
-    if group:
-        records.append(group)
-    return records
-
-def validate_fasta_record(lines):
-    header = lines[0].strip()
-    if not header.startswith(">") or len(header) == 1:
-        return False, "Invalid FASTA header"
-    for seq_line in lines[1:]:
-        seq = seq_line.strip()
-        if not VALID_SEQ_RE.fullmatch(seq):
-            return False, f"Invalid sequence line: '{seq}'"
-    return True, None
-
-def validate_file(filepath, filetype='auto', max_workers=4):
+def validate_fastq(filepath):
     try:
         with open_file(filepath) as f:
-            first_line = f.readline()
-            if filetype == 'auto':
-                if first_line.startswith(">"):
-                    filetype = 'fasta'
-                elif first_line.startswith("@"):
-                    filetype = 'fastq'
-                else:
-                    return False, "Unrecognized file format"
-            f.seek(0)
-
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                if filetype == 'fastq':
-                    records = list(parse_fastq(f))
-                    futures = [pool.submit(validate_fastq_record, rec) for rec in records]
-                else:
-                    records = parse_fasta(f)
-                    futures = [pool.submit(validate_fasta_record, rec) for rec in records]
-
-                for fut in as_completed(futures):
-                    ok, err = fut.result()
-                    if not ok:
-                        return False, f"{filepath}: {err}"
-        return True, f"{filepath}: Valid {filetype.upper()}"
+            lineno = 0
+            while True:
+                lines = list(islice(f, 4))
+                if not lines:
+                    break
+                lineno += 4
+                if len(lines) != 4:
+                    return False, f"{filepath}: Incomplete FASTQ record near line {lineno}"
+                h, s, p, q = [l.strip() for l in lines]
+                if not h.startswith("@"):
+                    return False, f"{filepath}: FASTQ header missing '@' at line {lineno - 3}"
+                if not p.startswith("+"):
+                    return False, f"{filepath}: FASTQ '+' line missing at line {lineno - 1}"
+                if len(s) != len(q):
+                    return False, f"{filepath}: Sequence and quality length mismatch at line {lineno - 2}"
+        return True, f"{filepath}: Valid FASTQ"
     except Exception as e:
-        return False, f"{filepath}: Exception: {e}"
+        return False, f"{filepath}: Error reading FASTQ: {e}"
+
+def validate_fasta(filepath):
+    try:
+        with open_file(filepath) as f:
+            lineno = 0
+            header_seen = False
+            for line in f:
+                lineno += 1
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith(">"):
+                    if len(line) == 1:
+                        return False, f"{filepath}: Empty FASTA header at line {lineno}"
+                    header_seen = True
+                else:
+                    if not header_seen:
+                        return False, f"{filepath}: Sequence found before any header at line {lineno}"
+                    if not VALID_SEQ_RE.fullmatch(line):
+                        return False, f"{filepath}: Invalid characters in sequence at line {lineno}"
+        return True, f"{filepath}: Valid FASTA"
+    except Exception as e:
+        return False, f"{filepath}: Error reading FASTA: {e}"
+
+def detect_format(filepath):
+    with open_file(filepath) as f:
+        for line in f:
+            if line.startswith(">"):
+                return "fasta"
+            elif line.startswith("@"):
+                return "fastq"
+            elif not line.strip():
+                continue
+            else:
+                break
+    return "unknown"
+
+def validate_file(filepath, filetype):
+    if filetype == "auto":
+        filetype = detect_format(filepath)
+        if filetype == "unknown":
+            return False, f"{filepath}: Could not detect file type"
+    if filetype == "fasta":
+        return validate_fasta(filepath)
+    elif filetype == "fastq":
+        return validate_fastq(filepath)
+    else:
+        return False, f"{filepath}: Invalid file type specified"
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate a FASTA or FASTQ file (optionally .gz)")
-    parser.add_argument("file", help="Path to .fasta, .fastq, or .gz file")
-    parser.add_argument("-t", "--threads", type=int, default=4, help="Number of threads (default: 4)")
-    parser.add_argument("-f", "--type", choices=["fasta", "fastq", "auto"], default="auto", help="Force file type (default: auto)")
-
+    parser = argparse.ArgumentParser(description="Validate FASTA/FASTQ file (streaming, low-memory)")
+    parser.add_argument("file", help="Path to FASTA/FASTQ file (optionally .gz)")
+    parser.add_argument("-f", "--type", choices=["fasta", "fastq", "auto"], default="auto",
+                        help="Force file type: fasta, fastq, or auto (default: auto)")
     args = parser.parse_args()
-    ok, msg = validate_file(args.file, args.type, args.threads)
+
+    ok, msg = validate_file(args.file, args.type)
     print(f"[✓] {msg}" if ok else f"[×] {msg}")
     sys.exit(0 if ok else 1)
 
